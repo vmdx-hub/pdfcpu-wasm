@@ -63,6 +63,10 @@ func optimizePDF(this js.Value, args []js.Value) interface{} {
 
 func main() {
 
+	// ブラウザWASMでは /tmp 等の設定フォルダを作れないため、
+	// pdfcpuの設定ディレクトリ機能を無効化する。
+	api.DisableConfigDir()
+
 	js.Global().Set(
 		"pdfcpuOptimize",
 		js.FuncOf(optimizePDF),
