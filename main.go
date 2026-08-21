@@ -5,6 +5,7 @@ import (
 	"syscall/js"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
 func optimizePDF(this js.Value, args []js.Value) interface{} {
@@ -31,11 +32,13 @@ func optimizePDF(this js.Value, args []js.Value) interface{} {
 
 	var output bytes.Buffer
 
-	err := api.Optimize(
-		reader,
-		&output,
-		nil,
-	)
+conf := model.NewDefaultConfiguration()
+
+err := api.Optimize(
+	reader,
+	&output,
+	conf,
+)
 
 	if err != nil {
 		return map[string]interface{}{
@@ -63,8 +66,6 @@ func optimizePDF(this js.Value, args []js.Value) interface{} {
 
 func main() {
 
-	// ブラウザWASMでは /tmp 等の設定フォルダを作れないため、
-	// pdfcpuの設定ディレクトリ機能を無効化する。
 	api.DisableConfigDir()
 
 	js.Global().Set(
@@ -72,7 +73,7 @@ func main() {
 		js.FuncOf(optimizePDF),
 	)
 
-	println("pdfcpu WASM ready")
+	println("pdfcpu WASM ready v3")
 
 	select {}
 }
