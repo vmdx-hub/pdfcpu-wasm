@@ -154,37 +154,29 @@ func optimizePDF(this js.Value, args []js.Value) interface{} {
 	}
 
 	// ========================================
-	// 戻り値
-	// ========================================
+// 戻り値
+// ========================================
 
-	return map[string]interface{}{
-		"ok":     true,
-		"output": jsOutput,
-		"originalSize": len(
-			inputBytes,
-		),
-		"outputSize": len(
-			outputBytes,
-		),
-	}
+return map[string]interface{}{
+    "ok":           true,
+    "output":       jsOutput,
+    "originalSize": len(inputBytes),
+    "outputSize":   len(outputBytes),
+}
 }
 
 func main() {
 
-	// ブラウザWASMでは設定ディレクトリを
-	// 使用できないため無効化
-	api.DisableConfigDir()
+    // ブラウザWASMでは設定ディレクトリを
+    // 使用できないため無効化
+    api.DisableConfigDir()
 
-	js.Global().Set(
-		"pdfcpuOptimize",
-		js.FuncOf(
-			optimizePDF,
-		),
-	)
+    js.Global().Set(
+        "pdfcpuOptimize",
+        js.FuncOf(optimizePDF),
+    )
 
-	println(
-		"pdfcpu WASM ready - enhanced optimize"
-	)
+    println("pdfcpu WASM ready - enhanced optimize")
 
-	select {}
+    select {}
 }
