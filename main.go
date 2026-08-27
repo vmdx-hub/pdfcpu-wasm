@@ -43,21 +43,15 @@ func analyzeType3Fonts(
 
 	totalType3 := 0
 
-	baseFontCounts :=
-		map[string]int{}
+	baseFontCounts := map[string]int{}
 
-	objectNumbers :=
-		make(
-			[]int,
-			0,
-		)
+	objectNumbers := make([]int, 0)
 
 	// ========================================
 	// XRefTable全走査
 	// ========================================
 
-	for objectNumber, entry :=
-		range ctx.XRefTable.Table {
+	for objectNumber, entry := range ctx.XRefTable.Table {
 
 		if entry == nil ||
 			entry.Free ||
@@ -66,8 +60,7 @@ func analyzeType3Fonts(
 			continue
 		}
 
-		dict, ok :=
-			entry.Object.(types.Dict)
+		dict, ok := entry.Object.(types.Dict)
 
 		if !ok {
 			continue
@@ -77,25 +70,19 @@ func analyzeType3Fonts(
 		// /Type /Font
 		// ========================================
 
-		typeObj, found :=
-			dict.Find("Type")
+		typeObj, found := dict.Find("Type")
 
-		if !found ||
-			typeObj == nil {
-
+		if !found || typeObj == nil {
 			continue
 		}
 
-		typeName, ok :=
-			typeObj.(types.Name)
+		typeName, ok := typeObj.(types.Name)
 
 		if !ok {
 			continue
 		}
 
-		if string(typeName) !=
-			"Font" {
-
+		if string(typeName) != "Font" {
 			continue
 		}
 
@@ -103,78 +90,61 @@ func analyzeType3Fonts(
 		// /Subtype /Type3
 		// ========================================
 
-		subtypeObj, found :=
-			dict.Find("Subtype")
+		subtypeObj, found := dict.Find("Subtype")
 
-		if !found ||
-			subtypeObj == nil {
-
+		if !found || subtypeObj == nil {
 			continue
 		}
 
-		subtypeName, ok :=
-			subtypeObj.(types.Name)
+		subtypeName, ok := subtypeObj.(types.Name)
 
 		if !ok {
 			continue
 		}
 
-		if string(subtypeName) !=
-			"Type3" {
-
+		if string(subtypeName) != "Type3" {
 			continue
 		}
 
 		totalType3++
 
-		objectNumbers =
-			append(
-				objectNumbers,
-				objectNumber,
-			)
+		objectNumbers = append(
+			objectNumbers,
+			objectNumber,
+		)
 
 		// ========================================
 		// BaseFont取得
 		// ========================================
 
-		baseFont :=
-			"(none)"
+		baseFont := "(none)"
 
-		baseFontObj, found :=
-			dict.Find("BaseFont")
+		baseFontObj, found := dict.Find("BaseFont")
 
-		if found &&
-			baseFontObj != nil {
+		if found && baseFontObj != nil {
 
-			switch v :=
-				baseFontObj.(type) {
+			switch v := baseFontObj.(type) {
 
 			case types.Name:
-				baseFont =
-					string(v)
+
+				baseFont = string(v)
 
 			default:
-				baseFont =
-					fmt.Sprintf(
-						"%v",
-						v,
-					)
+
+				baseFont = fmt.Sprintf(
+					"%v",
+					v,
+				)
 			}
 		}
 
-		baseFont =
-			strings.TrimSpace(
-				baseFont,
-			)
+		baseFont = strings.TrimSpace(baseFont)
 
 		if baseFont == "" {
-			baseFont =
-				"(empty)"
+			baseFont = "(empty)"
 		}
 
-		baseFontCounts[
-			baseFont
-		]++
+		baseFontCounts[baseFont]++
 	}
 
 	// ========================================
@@ -200,39 +170,32 @@ func analyzeType3Fonts(
 		count int
 	}
 
-	list :=
-		make(
-			[]fontCount,
-			0,
-			len(baseFontCounts),
+	list := make(
+		[]fontCount,
+		0,
+		len(baseFontCounts),
+	)
+
+	for name, count := range baseFontCounts {
+
+		list = append(
+			list,
+			fontCount{
+				name:  name,
+				count: count,
+			},
 		)
-
-	for name, count :=
-		range baseFontCounts {
-
-		list =
-			append(
-				list,
-				fontCount{
-					name:  name,
-					count: count,
-				},
-			)
 	}
 
 	sort.Slice(
 		list,
 		func(i, j int) bool {
 
-			if list[i].count ==
-				list[j].count {
-
-				return list[i].name <
-					list[j].name
+			if list[i].count == list[j].count {
+				return list[i].name < list[j].name
 			}
 
-			return list[i].count >
-				list[j].count
+			return list[i].count > list[j].count
 		},
 	)
 
@@ -242,20 +205,15 @@ func analyzeType3Fonts(
 
 	maxDisplay := 30
 
-	if len(list) <
-		maxDisplay {
-
-		maxDisplay =
-			len(list)
+	if len(list) < maxDisplay {
+		maxDisplay = len(list)
 	}
 
 	fmt.Println(
 		"[Type3 Scan] Top BaseFont duplicates:",
 	)
 
-	for i := 0;
-		i < maxDisplay;
-		i++ {
+	for i := 0; i < maxDisplay; i++ {
 
 		fmt.Printf(
 			"[Type3 Scan] #%d count=%d BaseFont=%s\n",
@@ -269,26 +227,21 @@ func analyzeType3Fonts(
 	// Type3 object番号
 	// ========================================
 
-	sort.Ints(
-		objectNumbers,
-	)
+	sort.Ints(objectNumbers)
 
 	maxObjects := 50
 
-	if len(objectNumbers) <
-		maxObjects {
-
-		maxObjects =
-			len(objectNumbers)
+	if len(objectNumbers) < maxObjects {
+		maxObjects = len(objectNumbers)
 	}
 
 	if maxObjects > 0 {
 
+		firstObjects := objectNumbers[0:maxObjects]
+
 		fmt.Println(
 			"[Type3 Scan] First Type3 object numbers:",
-			objectNumbers[
-				0:maxObjects
-			],
+			firstObjects,
 		)
 	}
 
@@ -318,11 +271,9 @@ func optimizePDF(
 		}
 	}
 
-	input :=
-		args[0]
+	input := args[0]
 
-	if input.Type() !=
-		js.TypeObject {
+	if input.Type() != js.TypeObject {
 
 		return map[string]interface{}{
 			"ok":    false,
@@ -330,10 +281,7 @@ func optimizePDF(
 		}
 	}
 
-	length :=
-		input.Get(
-			"length",
-		).Int()
+	length := input.Get("length").Int()
 
 	if length <= 0 {
 
@@ -347,17 +295,15 @@ func optimizePDF(
 	// JS Uint8Array → Go []byte
 	// ========================================
 
-	inputBytes :=
-		make(
-			[]byte,
-			length,
-		)
+	inputBytes := make(
+		[]byte,
+		length,
+	)
 
-	copied :=
-		js.CopyBytesToGo(
-			inputBytes,
-			input,
-		)
+	copied := js.CopyBytesToGo(
+		inputBytes,
+		input,
+	)
 
 	if copied != length {
 
@@ -375,20 +321,20 @@ func optimizePDF(
 	// pdfcpu Configuration
 	// ========================================
 
-	conf :=
-		model.NewDefaultConfiguration()
+	conf := model.NewDefaultConfiguration()
 
-	conf.Optimize =
-		true
+	// 通常の内部最適化
+	conf.Optimize = true
 
-	conf.OptimizeResourceDicts =
-		true
+	// 未使用Resource削除
+	conf.OptimizeResourceDicts = true
 
-	conf.OptimizeDuplicateContentStreams =
-		true
+	// 重複Content Stream検出
+	conf.OptimizeDuplicateContentStreams = true
 
 	// ========================================
 	// Type3診断
+	// PDF自体は変更しない
 	// ========================================
 
 	analyzeType3Fonts(
@@ -397,22 +343,18 @@ func optimizePDF(
 	)
 
 	// ========================================
-	// Optimize
+	// pdfcpu Optimize
 	// ========================================
 
-	reader :=
-		bytes.NewReader(
-			inputBytes,
-		)
+	reader := bytes.NewReader(inputBytes)
 
 	var output bytes.Buffer
 
-	err :=
-		api.Optimize(
-			reader,
-			&output,
-			conf,
-		)
+	err := api.Optimize(
+		reader,
+		&output,
+		conf,
+	)
 
 	if err != nil {
 
@@ -425,8 +367,7 @@ func optimizePDF(
 		}
 	}
 
-	outputBytes :=
-		output.Bytes()
+	outputBytes := output.Bytes()
 
 	if len(outputBytes) <= 0 {
 
@@ -440,23 +381,16 @@ func optimizePDF(
 	// Go []byte → JS Uint8Array
 	// ========================================
 
-	jsOutput :=
-		js.Global().
-			Get(
-				"Uint8Array",
-			).
-			New(
-				len(outputBytes),
-			)
+	jsOutput := js.Global().
+		Get("Uint8Array").
+		New(len(outputBytes))
 
-	copied =
-		js.CopyBytesToJS(
-			jsOutput,
-			outputBytes,
-		)
+	copied = js.CopyBytesToJS(
+		jsOutput,
+		outputBytes,
+	)
 
-	if copied !=
-		len(outputBytes) {
+	if copied != len(outputBytes) {
 
 		return map[string]interface{}{
 			"ok": false,
@@ -486,13 +420,13 @@ func optimizePDF(
 
 func main() {
 
+	// ブラウザWASMでは
+	// 設定ディレクトリを使用しない
 	api.DisableConfigDir()
 
 	js.Global().Set(
 		"pdfcpuOptimize",
-		js.FuncOf(
-			optimizePDF,
-		),
+		js.FuncOf(optimizePDF),
 	)
 
 	println(
