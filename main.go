@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -12,462 +14,307 @@ import (
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 )
 
-// ========================================
-// Type3診断
-// Page → Resources → Font を辿る
-// ========================================
+var type3HashKeys = []string{
+	"FontBBox",
+	"FontMatrix",
+	"CharProcs",
+	"Encoding",
+	"Widths",
+	"FirstChar",
+	"LastChar",
+	"Resources",
+	"ToUnicode",
+}
 
-func analyzeType3Fonts(
-	inputBytes []byte,
-	conf *model.Configuration,
-) {
+func ignoreStreamKey(key string) bool {
+	switch key {
+	case "Length", "Filter", "DecodeParms":
+		return true
+	default:
+		return false
+	}
+}
 
-	fmt.Println("[Type3 Scan] Start")
+func canonicalObject(ctx *model.Context, obj types.Object, depth int, stack map[string]bool) (string, error) {
+	if obj == nil {
+		return "null", nil
+	}
+
+	if depth > 40 {
+		return "DEPTH_LIMIT", nil
+	}
+
+	if ir, ok := obj.(types.IndirectRef); ok {
+		refKey := fmt.Sprintf("%d:%d", ir.ObjectNumber.Value(), ir.GenerationNumber.Value())
+		if stack[refKey] {
+			return "CYCLE", nil
+		}
+
+		stack[refKey] = true
+		resolved, err := ctx.Dereference(ir)
+		if err != nil {
+			delete(stack, refKey)
+			return "", err
+		}
+
+		result, err := canonicalObject(ctx, resolved, depth+1, stack)
+		delete(stack, refKey)
+		return result, err
+	}
+
+	switch v := obj.(type) {
+	case types.StreamDict:
+		if err := v.Decode(); err != nil {
+			v.Content = v.Raw
+		}
+
+		keys := make([]string, 0, len(v.Dict))
+		for key := range v.Dict {
+			if !ignoreStreamKey(key) {
+				keys = append(keys, key)
+			}
+		}
+		sort.Strings(keys)
+
+		var b strings.Builder
+		b.WriteString("STREAM{")
+		for _, key := range keys {
+			childString, err := canonicalObject(ctx, v.Dict[key], depth+1, stack)
+			if err != nil {
+				return "", err
+			}
+			b.WriteString(key)
+			b.WriteString("=")
+			b.WriteString(childString)
+			b.WriteString(";")
+		}
+		b.WriteString("}DATA=")
+		sum := sha256.Sum256(v.Content)
+		b.WriteString(hex.EncodeToString(sum[:]))
+		return b.String(), nil
+
+	case types.Dict:
+		keys := make([]string, 0, len(v))
+		for key := range v {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+
+		var b strings.Builder
+		b.WriteString("DICT{")
+		for _, key := range keys {
+			childString, err := canonicalObject(ctx, v[key], depth+1, stack)
+			if err != nil {
+				return "", err
+			}
+			b.WriteString(key)
+			b.WriteString("=")
+			b.WriteString(childString)
+			b.WriteString(";")
+		}
+		b.WriteString("}")
+		return b.String(), nil
+
+	case types.Array:
+		var b strings.Builder
+		b.WriteString("ARRAY[")
+		for _, child := range v {
+			childString, err := canonicalObject(ctx, child, depth+1, stack)
+			if err != nil {
+				return "", err
+			}
+			b.WriteString(childString)
+			b.WriteString(",")
+		}
+		b.WriteString("]")
+		return b.String(), nil
+	}
+
+	return fmt.Sprintf("%T:%v", obj, obj), nil
+}
+
+func hashType3Font(ctx *model.Context, fontDict types.Dict) (string, error) {
+	var b strings.Builder
+	b.WriteString("Subtype=Type3;")
+
+	for _, key := range type3HashKeys {
+		obj, found := fontDict.Find(key)
+		b.WriteString(key)
+		b.WriteString("=")
+
+		if !found || obj == nil {
+			b.WriteString("(missing);")
+			continue
+		}
+
+		value, err := canonicalObject(ctx, obj, 0, map[string]bool{})
+		if err != nil {
+			return "", err
+		}
+		b.WriteString(value)
+		b.WriteString(";")
+	}
+
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func analyzeType3Hashes(inputBytes []byte, conf *model.Configuration) {
+	fmt.Println("[Type3 Hash] Start")
 
 	reader := bytes.NewReader(inputBytes)
-
 	ctx, err := api.ReadContext(reader, conf)
 	if err != nil {
-		fmt.Println(
-			"[Type3 Scan] ReadContext failed:",
-			err,
-		)
+		fmt.Println("[Type3 Hash] ReadContext failed:", err)
 		return
 	}
 
 	if ctx == nil || ctx.XRefTable == nil {
-		fmt.Println(
-			"[Type3 Scan] No XRefTable.",
-		)
+		fmt.Println("[Type3 Hash] No XRefTable.")
 		return
 	}
-
-	// ========================================
-	// PageCount初期化
-	// ========================================
 
 	if err := ctx.EnsurePageCount(); err != nil {
-		fmt.Println(
-			"[Type3 Scan] EnsurePageCount failed:",
-			err,
-		)
+		fmt.Println("[Type3 Hash] EnsurePageCount failed:", err)
 		return
 	}
 
-	pageCount := ctx.PageCount
+	fmt.Println("[Type3 Hash] page count:", ctx.PageCount)
 
-	fmt.Println(
-		"[Type3 Scan] page count:",
-		pageCount,
-	)
+	seenFonts := map[string]bool{}
+	hashCounts := map[string]int{}
+	hashRefs := map[string][]string{}
+	totalType3 := 0
+	hashErrors := 0
 
-	totalFontRefs := 0
-	totalType3Refs := 0
-
-	uniqueFontObjects := map[string]bool{}
-	uniqueType3Objects := map[string]bool{}
-	baseFontCounts := map[string]int{}
-	subtypeCounts := map[string]int{}
-
-	// ========================================
-	// 各ページ
-	// ========================================
-
-	for pageNr := 1; pageNr <= pageCount; pageNr++ {
-
-		pageDict, _, _, err :=
-			ctx.PageDict(
-				pageNr,
-				true,
-			)
-
-		if err != nil {
-			fmt.Printf(
-				"[Type3 Scan] Page %d PageDict error: %v\n",
-				pageNr,
-				err,
-			)
+	for pageNr := 1; pageNr <= ctx.PageCount; pageNr++ {
+		pageDict, _, _, err := ctx.PageDict(pageNr, true)
+		if err != nil || pageDict == nil {
 			continue
 		}
 
-		if pageDict == nil {
-			fmt.Printf(
-				"[Type3 Scan] Page %d missing PageDict\n",
-				pageNr,
-			)
-			continue
-		}
-
-		// ========================================
-		// Resources
-		// ========================================
-
-		resObj, found :=
-			pageDict.Find(
-				"Resources",
-			)
-
+		resObj, found := pageDict.Find("Resources")
 		if !found || resObj == nil {
-			fmt.Printf(
-				"[Type3 Scan] Page %d has no Resources\n",
-				pageNr,
-			)
 			continue
 		}
 
-		resDict, err :=
-			ctx.DereferenceDict(
-				resObj,
-			)
-
-		if err != nil {
-			fmt.Printf(
-				"[Type3 Scan] Page %d Resources error: %v\n",
-				pageNr,
-				err,
-			)
+		resDict, err := ctx.DereferenceDict(resObj)
+		if err != nil || resDict == nil {
 			continue
 		}
 
-		if resDict == nil {
-			continue
-		}
-
-		// ========================================
-		// Font Resources
-		// ========================================
-
-		fontObj, found :=
-			resDict.Find(
-				"Font",
-			)
-
+		fontObj, found := resDict.Find("Font")
 		if !found || fontObj == nil {
 			continue
 		}
 
-		fontResources, err :=
-			ctx.DereferenceDict(
-				fontObj,
-			)
-
-		if err != nil {
-			fmt.Printf(
-				"[Type3 Scan] Page %d Font Resources error: %v\n",
-				pageNr,
-				err,
-			)
+		fontResources, err := ctx.DereferenceDict(fontObj)
+		if err != nil || fontResources == nil {
 			continue
 		}
 
-		if fontResources == nil {
-			continue
-		}
+		for _, fontRef := range fontResources {
+			refKey := fmt.Sprintf("%v", fontRef)
+			if seenFonts[refKey] {
+				continue
+			}
+			seenFonts[refKey] = true
 
-		pageFontCount := 0
-		pageType3Count := 0
+			fontDict, err := ctx.DereferenceDict(fontRef)
+			if err != nil || fontDict == nil {
+				continue
+			}
 
-		// ========================================
-		// F1 / F2 / F3 ...
-		// ========================================
+			subtypeObj, found := fontDict.Find("Subtype")
+			if !found || subtypeObj == nil {
+				continue
+			}
 
-		for resourceName, fontRef := range fontResources {
+			subtypeName, ok := subtypeObj.(types.Name)
+			if !ok || string(subtypeName) != "Type3" {
+				continue
+			}
 
-			totalFontRefs++
-			pageFontCount++
-
-			fontKey :=
-				fmt.Sprintf(
-					"%v",
-					fontRef,
-				)
-
-			uniqueFontObjects[fontKey] = true
-
-			// ========================================
-			// Font Dictionary
-			// ========================================
-
-			fontDict, err :=
-				ctx.DereferenceDict(
-					fontRef,
-				)
-
+			totalType3++
+			hashValue, err := hashType3Font(ctx, fontDict)
 			if err != nil {
-				fmt.Printf(
-					"[Type3 Scan] Page %d Font %s dereference error: %v\n",
-					pageNr,
-					resourceName,
-					err,
-				)
+				hashErrors++
+				fmt.Printf("[Type3 Hash] ERROR ref=%s err=%v\n", refKey, err)
 				continue
 			}
 
-			if fontDict == nil {
-				continue
-			}
-
-			// ========================================
-			// Subtype
-			// ========================================
-
-			subtype := "(none)"
-
-			subtypeObj, found :=
-				fontDict.Find(
-					"Subtype",
-				)
-
-			if found && subtypeObj != nil {
-
-				switch v := subtypeObj.(type) {
-
-				case types.Name:
-					subtype = string(v)
-
-				default:
-					subtype = fmt.Sprintf(
-						"%v",
-						v,
-					)
-				}
-			}
-
-			subtype =
-				strings.TrimSpace(
-					subtype,
-				)
-
-			if subtype == "" {
-				subtype = "(empty)"
-			}
-
-			subtypeCounts[subtype]++
-
-			// ========================================
-			// Type3のみ
-			// ========================================
-
-			if subtype != "Type3" {
-				continue
-			}
-
-			totalType3Refs++
-			pageType3Count++
-
-			uniqueType3Objects[fontKey] = true
-
-			// ========================================
-			// BaseFont
-			// ========================================
-
-			baseFont := "(none)"
-
-			baseFontObj, found :=
-				fontDict.Find(
-					"BaseFont",
-				)
-
-			if found && baseFontObj != nil {
-
-				switch v := baseFontObj.(type) {
-
-				case types.Name:
-					baseFont = string(v)
-
-				default:
-					baseFont = fmt.Sprintf(
-						"%v",
-						v,
-					)
-				}
-			}
-
-			baseFont =
-				strings.TrimSpace(
-					baseFont,
-				)
-
-			if baseFont == "" {
-				baseFont = "(empty)"
-			}
-
-			baseFontCounts[baseFont]++
-
-			// ========================================
-			// 最初の20件だけ詳細表示
-			// ========================================
-
-			if totalType3Refs <= 20 {
-				fmt.Printf(
-					"[Type3 Scan] Page=%d Resource=%s Ref=%s BaseFont=%s\n",
-					pageNr,
-					resourceName,
-					fontKey,
-					baseFont,
-				)
-			}
-		}
-
-		if pageFontCount > 0 {
-			fmt.Printf(
-				"[Type3 Scan] Page %d fonts=%d type3=%d\n",
-				pageNr,
-				pageFontCount,
-				pageType3Count,
-			)
+			hashCounts[hashValue]++
+			hashRefs[hashValue] = append(hashRefs[hashValue], refKey)
 		}
 	}
 
-	// ========================================
-	// 集計用
-	// ========================================
-
-	type countItem struct {
-		name  string
+	type hashGroup struct {
+		hash  string
 		count int
 	}
 
-	// ========================================
-	// Subtype集計
-	// ========================================
+	groups := make([]hashGroup, 0, len(hashCounts))
+	duplicateObjects := 0
+	duplicateGroups := 0
+	maxGroup := 0
 
-	subtypeList :=
-		make(
-			[]countItem,
-			0,
-			len(subtypeCounts),
-		)
-
-	for name, count := range subtypeCounts {
-		subtypeList =
-			append(
-				subtypeList,
-				countItem{
-					name:  name,
-					count: count,
-				},
-			)
+	for hashValue, count := range hashCounts {
+		groups = append(groups, hashGroup{hash: hashValue, count: count})
+		if count > 1 {
+			duplicateGroups++
+			duplicateObjects += count - 1
+			if count > maxGroup {
+				maxGroup = count
+			}
+		}
 	}
 
-	sort.Slice(
-		subtypeList,
-		func(i, j int) bool {
-			return subtypeList[i].count > subtypeList[j].count
-		},
-	)
+	sort.Slice(groups, func(i, j int) bool {
+		return groups[i].count > groups[j].count
+	})
 
-	fmt.Println(
-		"[Type3 Scan] Font subtype summary:",
-	)
+	fmt.Println("[Type3 Hash] =================================")
+	fmt.Println("[Type3 Hash] total Type3 objects:", totalType3)
+	fmt.Println("[Type3 Hash] unique hashes:", len(hashCounts))
+	fmt.Println("[Type3 Hash] duplicate groups:", duplicateGroups)
+	fmt.Println("[Type3 Hash] duplicate objects removable:", duplicateObjects)
+	fmt.Println("[Type3 Hash] largest duplicate group:", maxGroup)
+	fmt.Println("[Type3 Hash] hash errors:", hashErrors)
 
-	for _, item := range subtypeList {
+	if totalType3 > 0 {
+		rate := float64(duplicateObjects) / float64(totalType3) * 100
+		fmt.Printf("[Type3 Hash] duplicate rate: %.1f%%\n", rate)
+	}
+
+	fmt.Println("[Type3 Hash] Top duplicate groups:")
+	displayed := 0
+	for _, group := range groups {
+		if group.count <= 1 {
+			break
+		}
+
+		shortHash := group.hash
+		if len(shortHash) > 16 {
+			shortHash = shortHash[:16]
+		}
+
 		fmt.Printf(
-			"[Type3 Scan] subtype=%s refs=%d\n",
-			item.name,
-			item.count,
-		)
-	}
-
-	// ========================================
-	// BaseFont集計
-	// ========================================
-
-	baseFontList :=
-		make(
-			[]countItem,
-			0,
-			len(baseFontCounts),
+			"[Type3 Hash] count=%d hash=%s refs=%v\n",
+			group.count,
+			shortHash,
+			hashRefs[group.hash],
 		)
 
-	for name, count := range baseFontCounts {
-		baseFontList =
-			append(
-				baseFontList,
-				countItem{
-					name:  name,
-					count: count,
-				},
-			)
+		displayed++
+		if displayed >= 20 {
+			break
+		}
 	}
 
-	sort.Slice(
-		baseFontList,
-		func(i, j int) bool {
-			return baseFontList[i].count > baseFontList[j].count
-		},
-	)
-
-	// ========================================
-	// 最終結果
-	// ========================================
-
-	fmt.Println(
-		"[Type3 Scan] =================================",
-	)
-
-	fmt.Println(
-		"[Type3 Scan] total font resource refs:",
-		totalFontRefs,
-	)
-
-	fmt.Println(
-		"[Type3 Scan] unique font objects:",
-		len(uniqueFontObjects),
-	)
-
-	fmt.Println(
-		"[Type3 Scan] total Type3 resource refs:",
-		totalType3Refs,
-	)
-
-	fmt.Println(
-		"[Type3 Scan] unique Type3 objects:",
-		len(uniqueType3Objects),
-	)
-
-	fmt.Println(
-		"[Type3 Scan] unique Type3 BaseFont names:",
-		len(baseFontCounts),
-	)
-
-	fmt.Println(
-		"[Type3 Scan] Top Type3 BaseFonts:",
-	)
-
-	maxDisplay := 30
-
-	if len(baseFontList) < maxDisplay {
-		maxDisplay = len(baseFontList)
-	}
-
-	for i := 0; i < maxDisplay; i++ {
-		fmt.Printf(
-			"[Type3 Scan] #%d count=%d BaseFont=%s\n",
-			i+1,
-			baseFontList[i].count,
-			baseFontList[i].name,
-		)
-	}
-
-	fmt.Println(
-		"[Type3 Scan] Finished",
-	)
+	fmt.Println("[Type3 Hash] Finished")
 }
 
-// ========================================
-// PDF Optimize
-// ========================================
-
-func optimizePDF(
-	this js.Value,
-	args []js.Value,
-) interface{} {
-
-	// ========================================
-	// 引数チェック
-	// ========================================
-
+func optimizePDF(this js.Value, args []js.Value) interface{} {
 	if len(args) < 1 {
 		return map[string]interface{}{
 			"ok":    false,
@@ -476,7 +323,6 @@ func optimizePDF(
 	}
 
 	input := args[0]
-
 	if input.Type() != js.TypeObject {
 		return map[string]interface{}{
 			"ok":    false,
@@ -485,7 +331,6 @@ func optimizePDF(
 	}
 
 	length := input.Get("length").Int()
-
 	if length <= 0 {
 		return map[string]interface{}{
 			"ok":    false,
@@ -493,22 +338,8 @@ func optimizePDF(
 		}
 	}
 
-	// ========================================
-	// JS → Go
-	// ========================================
-
-	inputBytes :=
-		make(
-			[]byte,
-			length,
-		)
-
-	copied :=
-		js.CopyBytesToGo(
-			inputBytes,
-			input,
-		)
-
+	inputBytes := make([]byte, length)
+	copied := js.CopyBytesToGo(inputBytes, input)
 	if copied != length {
 		return map[string]interface{}{
 			"ok": false,
@@ -520,56 +351,26 @@ func optimizePDF(
 		}
 	}
 
-	// ========================================
-	// pdfcpu Configuration
-	// ========================================
-
-	conf :=
-		model.NewDefaultConfiguration()
-
+	conf := model.NewDefaultConfiguration()
 	conf.Optimize = true
 	conf.OptimizeResourceDicts = true
 	conf.OptimizeDuplicateContentStreams = true
 
-	// ========================================
-	// Type3診断
-	// ========================================
+	// Diagnostic only: this does not modify the PDF.
+	analyzeType3Hashes(inputBytes, conf)
 
-	analyzeType3Fonts(
-		inputBytes,
-		conf,
-	)
-
-	// ========================================
-	// Optimize
-	// ========================================
-
-	reader :=
-		bytes.NewReader(
-			inputBytes,
-		)
-
+	reader := bytes.NewReader(inputBytes)
 	var output bytes.Buffer
 
-	err :=
-		api.Optimize(
-			reader,
-			&output,
-			conf,
-		)
-
+	err := api.Optimize(reader, &output, conf)
 	if err != nil {
 		return map[string]interface{}{
-			"ok": false,
-			"error": fmt.Sprintf(
-				"pdfcpu Optimize failed: %v",
-				err,
-			),
+			"ok":    false,
+			"error": fmt.Sprintf("pdfcpu Optimize failed: %v", err),
 		}
 	}
 
 	outputBytes := output.Bytes()
-
 	if len(outputBytes) <= 0 {
 		return map[string]interface{}{
 			"ok":    false,
@@ -577,21 +378,8 @@ func optimizePDF(
 		}
 	}
 
-	// ========================================
-	// Go → JS
-	// ========================================
-
-	jsOutput :=
-		js.Global().
-			Get("Uint8Array").
-			New(len(outputBytes))
-
-	copied =
-		js.CopyBytesToJS(
-			jsOutput,
-			outputBytes,
-		)
-
+	jsOutput := js.Global().Get("Uint8Array").New(len(outputBytes))
+	copied = js.CopyBytesToJS(jsOutput, outputBytes)
 	if copied != len(outputBytes) {
 		return map[string]interface{}{
 			"ok": false,
@@ -611,12 +399,7 @@ func optimizePDF(
 	}
 }
 
-// ========================================
-// main
-// ========================================
-
 func main() {
-
 	api.DisableConfigDir()
 
 	js.Global().Set(
@@ -624,9 +407,6 @@ func main() {
 		js.FuncOf(optimizePDF),
 	)
 
-	println(
-		"pdfcpu WASM ready - page resource Type3 scan v3",
-	)
-
+	println("pdfcpu WASM ready - Type3 deep hash scan")
 	select {}
 }
