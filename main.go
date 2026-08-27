@@ -14,6 +14,7 @@ import (
 
 // ========================================
 // Type3診断
+// 各Page → Resources → Font を辿る
 // ========================================
 
 func analyzeType3Fonts(
@@ -41,182 +42,483 @@ func analyzeType3Fonts(
 		return
 	}
 
-	totalType3 := 0
+	pageCount := ctx.PageCount
 
-	baseFontCounts := map[string]int{}
+	fmt.Println(
+		"[Type3 Scan] page count:",
+		pageCount,
+	)
 
-	objectNumbers := make([]int, 0)
+	totalFontRefs := 0
+	totalType3Refs := 0
+
+	uniqueFontObjects :=
+		map[string]bool{}
+
+	uniqueType3Objects :=
+		map[string]bool{}
+
+	baseFontCounts :=
+		map[string]int{}
+
+	subtypeCounts :=
+		map[string]int{}
 
 	// ========================================
-	// XRefTable全走査
-	//
-	// /Type /Font は条件にしない
-	// /Subtype /Type3 のみで判定
+	// 各ページ走査
 	// ========================================
 
-	for objectNumber, entry := range ctx.XRefTable.Table {
+	for pageNr := 1;
+		pageNr <= pageCount;
+		pageNr++ {
 
-		if entry == nil ||
-			entry.Free ||
-			entry.Object == nil {
+		// true:
+		// inherited resourcesを統合した状態で取得
+		pageDict, _, _, err :=
+			ctx.PageDict(
+				pageNr,
+				true,
+			)
+
+		if err != nil {
+
+			fmt.Printf(
+				"[Type3 Scan] Page %d PageDict error: %v\n",
+				pageNr,
+				err,
+			)
 
 			continue
 		}
 
-		dict, ok := entry.Object.(types.Dict)
+		if pageDict == nil {
 
-		if !ok {
+			fmt.Printf(
+				"[Type3 Scan] Page %d missing PageDict\n",
+				pageNr,
+			)
+
 			continue
 		}
 
 		// ========================================
-		// /Subtype /Type3
+		// /Resources
 		// ========================================
 
-		subtypeObj, found :=
-			dict.Find("Subtype")
+		resObj, found :=
+			pageDict.Find(
+				"Resources",
+			)
 
 		if !found ||
-			subtypeObj == nil {
+			resObj == nil {
+
+			fmt.Printf(
+				"[Type3 Scan] Page %d has no Resources\n",
+				pageNr,
+			)
 
 			continue
 		}
 
-		subtypeName, ok :=
-			subtypeObj.(types.Name)
+		resDict, err :=
+			ctx.DereferenceDict(
+				resObj,
+			)
 
-		if !ok {
+		if err != nil {
+
+			fmt.Printf(
+				"[Type3 Scan] Page %d Resources error: %v\n",
+				pageNr,
+				err,
+			)
+
 			continue
 		}
 
-		if string(subtypeName) != "Type3" {
+		if resDict == nil {
 			continue
 		}
-
-		totalType3++
-
-		objectNumbers = append(
-			objectNumbers,
-			objectNumber,
-		)
 
 		// ========================================
-		// BaseFont取得
-		// Type3では無い場合もある
+		// /Font
 		// ========================================
 
-		baseFont := "(none)"
+		fontObj, found :=
+			resDict.Find(
+				"Font",
+			)
 
-		baseFontObj, found :=
-			dict.Find("BaseFont")
+		if !found ||
+			fontObj == nil {
 
-		if found &&
-			baseFontObj != nil {
+			continue
+		}
 
-			switch v :=
-				baseFontObj.(type) {
+		fontResources, err :=
+			ctx.DereferenceDict(
+				fontObj,
+			)
 
-			case types.Name:
+		if err != nil {
 
+			fmt.Printf(
+				"[Type3 Scan] Page %d Font Resources error: %v\n",
+				pageNr,
+				err,
+			)
+
+			continue
+		}
+
+		if fontResources == nil {
+			continue
+		}
+
+		pageFontCount := 0
+		pageType3Count := 0
+
+		// ========================================
+		// Font Resource Dictionary
+		// F1, F2, F3...
+		// ========================================
+
+		for resourceName, fontRef :=
+			range fontResources {
+
+			totalFontRefs++
+			pageFontCount++
+
+			// ========================================
+			// Font object識別用キー
+			// ========================================
+
+			fontKey :=
+				fmt.Sprintf(
+					"%v",
+					fontRef,
+				)
+
+			uniqueFontObjects[
+				fontKey
+			] = true
+
+			// ========================================
+			// Font辞書をDereference
+			// ========================================
+
+			fontDict, err :=
+				ctx.DereferenceDict(
+					fontRef,
+				)
+
+			if err != nil {
+
+				fmt.Printf(
+					"[Type3 Scan] Page %d Font %s dereference error: %v\n",
+					pageNr,
+					resourceName,
+					err,
+				)
+
+				continue
+			}
+
+			if fontDict == nil {
+				continue
+			}
+
+			// ========================================
+			// Subtype
+			// ========================================
+
+			subtype :=
+				"(none)"
+
+			subtypeObj, found :=
+				fontDict.Find(
+					"Subtype",
+				)
+
+			if found &&
+				subtypeObj != nil {
+
+				switch v :=
+					subtypeObj.(type) {
+
+				case types.Name:
+
+					subtype =
+						string(v)
+
+				default:
+
+					subtype =
+						fmt.Sprintf(
+							"%v",
+							v,
+						)
+				}
+			}
+
+			subtype =
+				strings.TrimSpace(
+					subtype,
+				)
+
+			if subtype == "" {
+				subtype =
+					"(empty)"
+			}
+
+			subtypeCounts[
+				subtype
+			]++
+
+			// ========================================
+			// Type3以外はここで終了
+			// ========================================
+
+			if subtype !=
+				"Type3" {
+
+				continue
+			}
+
+			totalType3Refs++
+			pageType3Count++
+
+			uniqueType3Objects[
+				fontKey
+			] = true
+
+			// ========================================
+			// BaseFont
+			// ========================================
+
+			baseFont :=
+				"(none)"
+
+			baseFontObj, found :=
+				fontDict.Find(
+					"BaseFont",
+				)
+
+			if found &&
+				baseFontObj != nil {
+
+				switch v :=
+					baseFontObj.(type) {
+
+				case types.Name:
+
+					baseFont =
+						string(v)
+
+				default:
+
+					baseFont =
+						fmt.Sprintf(
+							"%v",
+							v,
+						)
+				}
+			}
+
+			baseFont =
+				strings.TrimSpace(
+					baseFont,
+				)
+
+			if baseFont == "" {
 				baseFont =
-					string(v)
+					"(empty)"
+			}
 
-			default:
+			baseFontCounts[
+				baseFont
+			]++
 
-				baseFont =
-					fmt.Sprintf(
-						"%v",
-						v,
-					)
+			// ========================================
+			// 最初のType3だけ詳細表示
+			// ========================================
+
+			if totalType3Refs <= 20 {
+
+				fmt.Printf(
+					"[Type3 Scan] Page=%d Resource=%s Ref=%s BaseFont=%s\n",
+					pageNr,
+					resourceName,
+					fontKey,
+					baseFont,
+				)
 			}
 		}
 
-		baseFont =
-			strings.TrimSpace(
-				baseFont,
+		if pageFontCount > 0 {
+
+			fmt.Printf(
+				"[Type3 Scan] Page %d fonts=%d type3=%d\n",
+				pageNr,
+				pageFontCount,
+				pageType3Count,
 			)
-
-		if baseFont == "" {
-			baseFont =
-				"(empty)"
 		}
-
-		baseFontCounts[baseFont]++
 	}
 
 	// ========================================
-	// 結果
+	// Subtype集計
 	// ========================================
 
-	fmt.Println(
-		"[Type3 Scan] total Type3 fonts:",
-		totalType3,
-	)
-
-	fmt.Println(
-		"[Type3 Scan] unique BaseFont names:",
-		len(baseFontCounts),
-	)
-
-	// ========================================
-	// 出現数順
-	// ========================================
-
-	type fontCount struct {
+	type countItem struct {
 		name  string
 		count int
 	}
 
-	list := make(
-		[]fontCount,
-		0,
-		len(baseFontCounts),
+	subtypeList :=
+		make(
+			[]countItem,
+			0,
+			len(
+				subtypeCounts,
+			),
+		)
+
+	for name, count :=
+		range subtypeCounts {
+
+		subtypeList =
+			append(
+				subtypeList,
+				countItem{
+					name:  name,
+					count: count,
+				},
+			)
+	}
+
+	sort.Slice(
+		subtypeList,
+		func(
+			i,
+			j int,
+		) bool {
+
+			return (
+				subtypeList[i].count >
+					subtypeList[j].count
+			)
+		},
 	)
+
+	fmt.Println(
+		"[Type3 Scan] Font subtype summary:",
+	)
+
+	for _, item :=
+		range subtypeList {
+
+		fmt.Printf(
+			"[Type3 Scan] subtype=%s refs=%d\n",
+			item.name,
+			item.count,
+		)
+	}
+
+	// ========================================
+	// BaseFont集計
+	// ========================================
+
+	baseFontList :=
+		make(
+			[]countItem,
+			0,
+			len(
+				baseFontCounts,
+			),
+		)
 
 	for name, count :=
 		range baseFontCounts {
 
-		list = append(
-			list,
-			fontCount{
-				name:  name,
-				count: count,
-			},
-		)
+		baseFontList =
+			append(
+				baseFontList,
+				countItem{
+					name:  name,
+					count: count,
+				},
+			)
 	}
 
 	sort.Slice(
-		list,
-		func(i, j int) bool {
+		baseFontList,
+		func(
+			i,
+			j int,
+		) bool {
 
-			if list[i].count ==
-				list[j].count {
-
-				return list[i].name <
-					list[j].name
-			}
-
-			return list[i].count >
-				list[j].count
+			return (
+				baseFontList[i].count >
+					baseFontList[j].count
+			)
 		},
 	)
 
 	// ========================================
-	// 上位30件
+	// 最終結果
 	// ========================================
+
+	fmt.Println(
+		"[Type3 Scan] =================================",
+	)
+
+	fmt.Println(
+		"[Type3 Scan] total font resource refs:",
+		totalFontRefs,
+	)
+
+	fmt.Println(
+		"[Type3 Scan] unique font objects:",
+		len(
+			uniqueFontObjects,
+		),
+	)
+
+	fmt.Println(
+		"[Type3 Scan] total Type3 resource refs:",
+		totalType3Refs,
+	)
+
+	fmt.Println(
+		"[Type3 Scan] unique Type3 objects:",
+		len(
+			uniqueType3Objects,
+		),
+	)
+
+	fmt.Println(
+		"[Type3 Scan] unique Type3 BaseFont names:",
+		len(
+			baseFontCounts,
+		),
+	)
+
+	fmt.Println(
+		"[Type3 Scan] Top Type3 BaseFonts:",
+	)
 
 	maxDisplay := 30
 
-	if len(list) <
+	if len(baseFontList) <
 		maxDisplay {
 
 		maxDisplay =
-			len(list)
+			len(
+				baseFontList,
+			)
 	}
-
-	fmt.Println(
-		"[Type3 Scan] Top BaseFont duplicates:",
-	)
 
 	for i := 0;
 		i < maxDisplay;
@@ -225,36 +527,8 @@ func analyzeType3Fonts(
 		fmt.Printf(
 			"[Type3 Scan] #%d count=%d BaseFont=%s\n",
 			i+1,
-			list[i].count,
-			list[i].name,
-		)
-	}
-
-	// ========================================
-	// Type3 object番号
-	// ========================================
-
-	sort.Ints(
-		objectNumbers,
-	)
-
-	maxObjects := 50
-
-	if len(objectNumbers) <
-		maxObjects {
-
-		maxObjects =
-			len(objectNumbers)
-	}
-
-	if maxObjects > 0 {
-
-		firstObjects :=
-			objectNumbers[0:maxObjects]
-
-		fmt.Println(
-			"[Type3 Scan] First Type3 object numbers:",
-			firstObjects,
+			baseFontList[i].count,
+			baseFontList[i].name,
 		)
 	}
 
@@ -284,7 +558,8 @@ func optimizePDF(
 		}
 	}
 
-	input := args[0]
+	input :=
+		args[0]
 
 	if input.Type() !=
 		js.TypeObject {
@@ -324,7 +599,8 @@ func optimizePDF(
 			input,
 		)
 
-	if copied != length {
+	if copied !=
+		length {
 
 		return map[string]interface{}{
 			"ok": false,
@@ -354,7 +630,6 @@ func optimizePDF(
 
 	// ========================================
 	// Type3診断
-	// PDF自体は変更しない
 	// ========================================
 
 	analyzeType3Fonts(
@@ -412,7 +687,9 @@ func optimizePDF(
 				"Uint8Array",
 			).
 			New(
-				len(outputBytes),
+				len(
+					outputBytes,
+				),
 			)
 
 	copied =
@@ -422,13 +699,17 @@ func optimizePDF(
 		)
 
 	if copied !=
-		len(outputBytes) {
+		len(
+			outputBytes,
+		) {
 
 		return map[string]interface{}{
 			"ok": false,
 			"error": fmt.Sprintf(
 				"Failed to copy output PDF bytes. expected=%d copied=%d",
-				len(outputBytes),
+				len(
+					outputBytes,
+				),
 				copied,
 			),
 		}
@@ -462,7 +743,7 @@ func main() {
 	)
 
 	println(
-		"pdfcpu WASM ready - enhanced optimize + Type3 scan v2",
+		"pdfcpu WASM ready - page resource Type3 scan",
 	)
 
 	select {}
