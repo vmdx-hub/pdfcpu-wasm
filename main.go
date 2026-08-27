@@ -39,7 +39,6 @@ func canonicalObject(ctx *model.Context, obj types.Object, depth int, stack map[
 	if obj == nil {
 		return "null", nil
 	}
-
 	if depth > 40 {
 		return "DEPTH_LIMIT", nil
 	}
@@ -49,14 +48,12 @@ func canonicalObject(ctx *model.Context, obj types.Object, depth int, stack map[
 		if stack[refKey] {
 			return "CYCLE", nil
 		}
-
 		stack[refKey] = true
 		resolved, err := ctx.Dereference(ir)
 		if err != nil {
 			delete(stack, refKey)
 			return "", err
 		}
-
 		result, err := canonicalObject(ctx, resolved, depth+1, stack)
 		delete(stack, refKey)
 		return result, err
@@ -67,7 +64,6 @@ func canonicalObject(ctx *model.Context, obj types.Object, depth int, stack map[
 		if err := v.Decode(); err != nil {
 			v.Content = v.Raw
 		}
-
 		keys := make([]string, 0, len(v.Dict))
 		for key := range v.Dict {
 			if !ignoreStreamKey(key) {
@@ -133,7 +129,7 @@ func canonicalObject(ctx *model.Context, obj types.Object, depth int, stack map[
 	return fmt.Sprintf("%T:%v", obj, obj), nil
 }
 
-func hashType3Font(ctx *model.Context, fontDict types.Dict) (string, error) {
+func type3Signature(ctx *model.Context, fontDict types.Dict) (string, string, error) {
 	var b strings.Builder
 	b.WriteString("Subtype=Type3;")
 
@@ -141,7 +137,6 @@ func hashType3Font(ctx *model.Context, fontDict types.Dict) (string, error) {
 		obj, found := fontDict.Find(key)
 		b.WriteString(key)
 		b.WriteString("=")
-
 		if !found || obj == nil {
 			b.WriteString("(missing);")
 			continue
@@ -149,43 +144,34 @@ func hashType3Font(ctx *model.Context, fontDict types.Dict) (string, error) {
 
 		value, err := canonicalObject(ctx, obj, 0, map[string]bool{})
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 		b.WriteString(value)
 		b.WriteString(";")
 	}
 
-	sum := sha256.Sum256([]byte(b.String()))
-	return hex.EncodeToString(sum[:]), nil
+	signature := b.String()
+	sum := sha256.Sum256([]byte(signature))
+	return signature, hex.EncodeToString(sum[:]), nil
 }
 
-func analyzeType3Hashes(inputBytes []byte, conf *model.Configuration) {
-	fmt.Println("[Type3 Hash] Start")
-
-	reader := bytes.NewReader(inputBytes)
-	ctx, err := api.ReadContext(reader, conf)
-	if err != nil {
-		fmt.Println("[Type3 Hash] ReadContext failed:", err)
-		return
-	}
-
+func deduplicateType3Fonts(ctx *model.Context) (int, int, int, error) {
 	if ctx == nil || ctx.XRefTable == nil {
-		fmt.Println("[Type3 Hash] No XRefTable.")
-		return
+		return 0, 0, 0, fmt.Errorf("missing PDF context")
 	}
-
 	if err := ctx.EnsurePageCount(); err != nil {
-		fmt.Println("[Type3 Hash] EnsurePageCount failed:", err)
-		return
+		return 0, 0, 0, err
 	}
 
-	fmt.Println("[Type3 Hash] page count:", ctx.PageCount)
+	fmt.Println("[Type3 Dedup] Start")
+	fmt.Println("[Type3 Dedup] page count:", ctx.PageCount)
 
-	seenFonts := map[string]bool{}
-	hashCounts := map[string]int{}
-	hashRefs := map[string][]string{}
+	representativeBySignature := map[string]types.IndirectRef{}
+	hashBySignature := map[string]string{}
+	groupCounts := map[string]int{}
+	seenOriginalRefs := map[string]bool{}
 	totalType3 := 0
-	hashErrors := 0
+	replaced := 0
 
 	for pageNr := 1; pageNr <= ctx.PageCount; pageNr++ {
 		pageDict, _, _, err := ctx.PageDict(pageNr, true)
@@ -197,7 +183,6 @@ func analyzeType3Hashes(inputBytes []byte, conf *model.Configuration) {
 		if !found || resObj == nil {
 			continue
 		}
-
 		resDict, err := ctx.DereferenceDict(resObj)
 		if err != nil || resDict == nil {
 			continue
@@ -207,19 +192,18 @@ func analyzeType3Hashes(inputBytes []byte, conf *model.Configuration) {
 		if !found || fontObj == nil {
 			continue
 		}
-
 		fontResources, err := ctx.DereferenceDict(fontObj)
 		if err != nil || fontResources == nil {
 			continue
 		}
 
-		for _, fontRef := range fontResources {
-			refKey := fmt.Sprintf("%v", fontRef)
-			if seenFonts[refKey] {
+		for resourceName, fontObj := range fontResources {
+			fontRef, ok := fontObj.(types.IndirectRef)
+			if !ok {
 				continue
 			}
-			seenFonts[refKey] = true
 
+			refKey := fmt.Sprintf("%d:%d", fontRef.ObjectNumber.Value(), fontRef.GenerationNumber.Value())
 			fontDict, err := ctx.DereferenceDict(fontRef)
 			if err != nil || fontDict == nil {
 				continue
@@ -229,113 +213,82 @@ func analyzeType3Hashes(inputBytes []byte, conf *model.Configuration) {
 			if !found || subtypeObj == nil {
 				continue
 			}
-
 			subtypeName, ok := subtypeObj.(types.Name)
 			if !ok || string(subtypeName) != "Type3" {
 				continue
 			}
 
-			totalType3++
-			hashValue, err := hashType3Font(ctx, fontDict)
+			if !seenOriginalRefs[refKey] {
+				totalType3++
+				seenOriginalRefs[refKey] = true
+			}
+
+			signature, hashValue, err := type3Signature(ctx, fontDict)
 			if err != nil {
-				hashErrors++
-				fmt.Printf("[Type3 Hash] ERROR ref=%s err=%v\n", refKey, err)
+				return totalType3, replaced, len(representativeBySignature), err
+			}
+
+			groupCounts[signature]++
+			hashBySignature[signature] = hashValue
+
+			if representative, found := representativeBySignature[signature]; found {
+				if representative.ObjectNumber.Value() != fontRef.ObjectNumber.Value() || representative.GenerationNumber.Value() != fontRef.GenerationNumber.Value() {
+					fontResources[resourceName] = representative
+					replaced++
+				}
 				continue
 			}
 
-			hashCounts[hashValue]++
-			hashRefs[hashValue] = append(hashRefs[hashValue], refKey)
+			representativeBySignature[signature] = fontRef
 		}
 	}
 
-	type hashGroup struct {
+	type groupInfo struct {
 		hash  string
 		count int
 	}
-
-	groups := make([]hashGroup, 0, len(hashCounts))
-	duplicateObjects := 0
-	duplicateGroups := 0
-	maxGroup := 0
-
-	for hashValue, count := range hashCounts {
-		groups = append(groups, hashGroup{hash: hashValue, count: count})
+	groups := make([]groupInfo, 0)
+	for signature, count := range groupCounts {
 		if count > 1 {
-			duplicateGroups++
-			duplicateObjects += count - 1
-			if count > maxGroup {
-				maxGroup = count
-			}
+			groups = append(groups, groupInfo{hash: hashBySignature[signature], count: count})
 		}
 	}
+	sort.Slice(groups, func(i, j int) bool { return groups[i].count > groups[j].count })
 
-	sort.Slice(groups, func(i, j int) bool {
-		return groups[i].count > groups[j].count
-	})
+	fmt.Println("[Type3 Dedup] =================================")
+	fmt.Println("[Type3 Dedup] total Type3 objects:", totalType3)
+	fmt.Println("[Type3 Dedup] unique signatures:", len(representativeBySignature))
+	fmt.Println("[Type3 Dedup] resource refs replaced:", replaced)
+	fmt.Println("[Type3 Dedup] duplicate groups:", len(groups))
 
-	fmt.Println("[Type3 Hash] =================================")
-	fmt.Println("[Type3 Hash] total Type3 objects:", totalType3)
-	fmt.Println("[Type3 Hash] unique hashes:", len(hashCounts))
-	fmt.Println("[Type3 Hash] duplicate groups:", duplicateGroups)
-	fmt.Println("[Type3 Hash] duplicate objects removable:", duplicateObjects)
-	fmt.Println("[Type3 Hash] largest duplicate group:", maxGroup)
-	fmt.Println("[Type3 Hash] hash errors:", hashErrors)
-
-	if totalType3 > 0 {
-		rate := float64(duplicateObjects) / float64(totalType3) * 100
-		fmt.Printf("[Type3 Hash] duplicate rate: %.1f%%\n", rate)
+	maxDisplay := 20
+	if len(groups) < maxDisplay {
+		maxDisplay = len(groups)
 	}
-
-	fmt.Println("[Type3 Hash] Top duplicate groups:")
-	displayed := 0
-	for _, group := range groups {
-		if group.count <= 1 {
-			break
-		}
-
-		shortHash := group.hash
+	for i := 0; i < maxDisplay; i++ {
+		shortHash := groups[i].hash
 		if len(shortHash) > 16 {
 			shortHash = shortHash[:16]
 		}
-
-		fmt.Printf(
-			"[Type3 Hash] count=%d hash=%s refs=%v\n",
-			group.count,
-			shortHash,
-			hashRefs[group.hash],
-		)
-
-		displayed++
-		if displayed >= 20 {
-			break
-		}
+		fmt.Printf("[Type3 Dedup] #%d count=%d hash=%s\n", i+1, groups[i].count, shortHash)
 	}
+	fmt.Println("[Type3 Dedup] Finished")
 
-	fmt.Println("[Type3 Hash] Finished")
+	return totalType3, replaced, len(representativeBySignature), nil
 }
 
 func optimizePDF(this js.Value, args []js.Value) interface{} {
 	if len(args) < 1 {
-		return map[string]interface{}{
-			"ok":    false,
-			"error": "Missing PDF input.",
-		}
+		return map[string]interface{}{"ok": false, "error": "Missing PDF input."}
 	}
-
 	input := args[0]
 	if input.Type() != js.TypeObject {
-		return map[string]interface{}{
-			"ok":    false,
-			"error": "Invalid PDF input.",
-		}
+		return map[string]interface{}{"ok": false, "error": "Invalid PDF input."}
 	}
 
 	length := input.Get("length").Int()
 	if length <= 0 {
-		return map[string]interface{}{
-			"ok":    false,
-			"error": "PDF input is empty.",
-		}
+		return map[string]interface{}{"ok": false, "error": "PDF input is empty."}
 	}
 
 	inputBytes := make([]byte, length)
@@ -343,70 +296,73 @@ func optimizePDF(this js.Value, args []js.Value) interface{} {
 	if copied != length {
 		return map[string]interface{}{
 			"ok": false,
-			"error": fmt.Sprintf(
-				"Failed to copy PDF bytes. expected=%d copied=%d",
-				length,
-				copied,
-			),
+			"error": fmt.Sprintf("Failed to copy PDF bytes. expected=%d copied=%d", length, copied),
 		}
 	}
 
 	conf := model.NewDefaultConfiguration()
+	conf.Cmd = model.OPTIMIZE
 	conf.Optimize = true
 	conf.OptimizeResourceDicts = true
 	conf.OptimizeDuplicateContentStreams = true
 
-	// Diagnostic only: this does not modify the PDF.
-	analyzeType3Hashes(inputBytes, conf)
-
 	reader := bytes.NewReader(inputBytes)
-	var output bytes.Buffer
-
-	err := api.Optimize(reader, &output, conf)
+	ctx, err := api.ReadValidateAndOptimize(reader, conf)
 	if err != nil {
 		return map[string]interface{}{
-			"ok":    false,
-			"error": fmt.Sprintf("pdfcpu Optimize failed: %v", err),
+			"ok": false,
+			"error": fmt.Sprintf("pdfcpu prepare failed: %v", err),
+		}
+	}
+
+	totalType3, replaced, uniqueType3, err := deduplicateType3Fonts(ctx)
+	if err != nil {
+		return map[string]interface{}{
+			"ok": false,
+			"error": fmt.Sprintf("Type3 dedup failed: %v", err),
+		}
+	}
+
+	var output bytes.Buffer
+	if err := api.WriteContext(ctx, &output); err != nil {
+		return map[string]interface{}{
+			"ok": false,
+			"error": fmt.Sprintf("pdfcpu write failed: %v", err),
 		}
 	}
 
 	outputBytes := output.Bytes()
 	if len(outputBytes) <= 0 {
-		return map[string]interface{}{
-			"ok":    false,
-			"error": "pdfcpu returned empty PDF.",
-		}
+		return map[string]interface{}{"ok": false, "error": "pdfcpu returned empty PDF."}
 	}
+
+	fmt.Println("[Type3 Dedup] Original bytes:", len(inputBytes))
+	fmt.Println("[Type3 Dedup] Output bytes:", len(outputBytes))
+	fmt.Printf("[Type3 Dedup] Saved: %.1f%%\n", float64(len(inputBytes)-len(outputBytes))/float64(len(inputBytes))*100)
 
 	jsOutput := js.Global().Get("Uint8Array").New(len(outputBytes))
 	copied = js.CopyBytesToJS(jsOutput, outputBytes)
 	if copied != len(outputBytes) {
 		return map[string]interface{}{
 			"ok": false,
-			"error": fmt.Sprintf(
-				"Failed to copy output PDF bytes. expected=%d copied=%d",
-				len(outputBytes),
-				copied,
-			),
+			"error": fmt.Sprintf("Failed to copy output PDF bytes. expected=%d copied=%d", len(outputBytes), copied),
 		}
 	}
 
 	return map[string]interface{}{
-		"ok":           true,
-		"output":       jsOutput,
-		"originalSize": len(inputBytes),
-		"outputSize":   len(outputBytes),
+		"ok":              true,
+		"output":          jsOutput,
+		"originalSize":    len(inputBytes),
+		"outputSize":      len(outputBytes),
+		"type3Total":      totalType3,
+		"type3Unique":     uniqueType3,
+		"type3RefsReplaced": replaced,
 	}
 }
 
 func main() {
 	api.DisableConfigDir()
-
-	js.Global().Set(
-		"pdfcpuOptimize",
-		js.FuncOf(optimizePDF),
-	)
-
-	println("pdfcpu WASM ready - Type3 deep hash scan")
+	js.Global().Set("pdfcpuOptimize", js.FuncOf(optimizePDF))
+	println("pdfcpu WASM ready - Type3 dedup enabled")
 	select {}
 }
