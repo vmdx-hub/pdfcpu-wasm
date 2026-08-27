@@ -5,11 +5,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"sort"
 	"strings"
 	"syscall/js"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/filter"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 )
@@ -25,6 +28,13 @@ var type3HashKeys = []string{
 	"Resources",
 	"ToUnicode",
 }
+
+const (
+	jpegQuality         = 85
+	minImageRawBytes    = 500 * 1024
+	minImageWidth       = 1000
+	minImageHeight      = 700
+)
 
 func ignoreStreamKey(key string) bool {
 	switch key {
@@ -159,7 +169,6 @@ func filterNames(sd *types.StreamDict) string {
 	if sd == nil || len(sd.FilterPipeline) == 0 {
 		return "(none)"
 	}
-
 	names := make([]string, 0, len(sd.FilterPipeline))
 	for _, f := range sd.FilterPipeline {
 		names = append(names, f.Name)
@@ -193,21 +202,76 @@ func imageColorSpace(sd *types.StreamDict) string {
 	return fmt.Sprintf("%v", obj)
 }
 
-func scanImages(ctx *model.Context) error {
+func imageComponents(ctx *model.Context, sd *types.StreamDict) (int, string) {
+	if sd == nil {
+		return 0, "(none)"
+	}
+
+	obj, found := sd.Find("ColorSpace")
+	if !found || obj == nil {
+		return 0, "(none)"
+	}
+
+	resolved, err := ctx.Dereference(obj)
+	if err != nil || resolved == nil {
+		return 0, fmt.Sprintf("%v", obj)
+	}
+
+	switch cs := resolved.(type) {
+	case types.Name:
+		name := string(cs)
+		switch name {
+		case "DeviceRGB":
+			return 3, name
+		case "DeviceGray":
+			return 1, name
+		case "DeviceCMYK":
+			return 4, name
+		default:
+			return 0, name
+		}
+
+	case types.Array:
+		if len(cs) >= 2 {
+			if n, ok := cs[0].(types.Name); ok && string(n) == "ICCBased" {
+				profile, _, err := ctx.DereferenceStreamDict(cs[1])
+				if err == nil && profile != nil {
+					if p := profile.IntEntry("N"); p != nil {
+						return *p, "ICCBased"
+					}
+				}
+				return 0, "ICCBased"
+			}
+		}
+		return 0, fmt.Sprintf("%v", cs)
+	}
+
+	return 0, fmt.Sprintf("%v", resolved)
+}
+
+func hasSoftMask(sd *types.StreamDict) bool {
+	if sd == nil {
+		return false
+	}
+	sm, found := sd.Find("SMask")
+	return found && sm != nil
+}
+
+func reencodeLargeFlateImages(ctx *model.Context) (int, int64, int64, error) {
 	if ctx == nil || ctx.XRefTable == nil {
-		return fmt.Errorf("missing PDF context")
+		return 0, 0, 0, fmt.Errorf("missing PDF context")
 	}
 	if err := ctx.EnsurePageCount(); err != nil {
-		return err
+		return 0, 0, 0, err
 	}
 
-	fmt.Println("[Image Scan] Start")
-	fmt.Println("[Image Scan] page count:", ctx.PageCount)
+	fmt.Println("[Image Reencode] Start")
+	fmt.Println("[Image Reencode] quality:", jpegQuality)
 
-	seenUnique := map[string]bool{}
-	uniqueCount := 0
-	pageRefs := 0
-	totalRawBytes := 0
+	seen := map[string]bool{}
+	reencoded := 0
+	var beforeTotal int64
+	var afterTotal int64
 
 	for pageNr := 1; pageNr <= ctx.PageCount; pageNr++ {
 		pageDict, _, _, err := ctx.PageDict(pageNr, true)
@@ -234,6 +298,12 @@ func scanImages(ctx *model.Context) error {
 		}
 
 		for resourceName, obj := range xObjects {
+			refKey := fmt.Sprintf("%v", obj)
+			if seen[refKey] {
+				continue
+			}
+			seen[refKey] = true
+
 			sd, _, err := ctx.DereferenceStreamDict(obj)
 			if err != nil || sd == nil {
 				continue
@@ -248,51 +318,114 @@ func scanImages(ctx *model.Context) error {
 				continue
 			}
 
-			pageRefs++
-
-			refKey := fmt.Sprintf("%v", obj)
-			if !seenUnique[refKey] {
-				seenUnique[refKey] = true
-				uniqueCount++
-				totalRawBytes += len(sd.Raw)
+			if !sd.HasSoleFilterNamed(filter.Flate) {
+				continue
+			}
+			if hasSoftMask(sd) {
+				continue
 			}
 
 			width := imageDimension(ctx, sd, "Width")
 			height := imageDimension(ctx, sd, "Height")
+			if width < minImageWidth || height < minImageHeight {
+				continue
+			}
+			if len(sd.Raw) < minImageRawBytes {
+				continue
+			}
+
 			bpc := 0
 			if p := sd.IntEntry("BitsPerComponent"); p != nil {
 				bpc = *p
 			}
-			hasSMask := false
-			if sm, found := sd.Find("SMask"); found && sm != nil {
-				hasSMask = true
+			if bpc != 8 {
+				continue
 			}
 
+			components, csName := imageComponents(ctx, sd)
+			if components != 3 {
+				fmt.Printf("[Image Reencode] skip page=%d resource=%s ref=%s components=%d colorSpace=%s\n", pageNr, resourceName, refKey, components, csName)
+				continue
+			}
+
+			before := len(sd.Raw)
+			if err := sd.Decode(); err != nil {
+				fmt.Printf("[Image Reencode] decode failed page=%d ref=%s err=%v\n", pageNr, refKey, err)
+				continue
+			}
+
+			expected := width * height * 3
+			if len(sd.Content) != expected {
+				fmt.Printf("[Image Reencode] skip unexpected decoded size page=%d ref=%s got=%d expected=%d\n", pageNr, refKey, len(sd.Content), expected)
+				continue
+			}
+
+			img := image.NewRGBA(image.Rect(0, 0, width, height))
+			src := sd.Content
+			dst := img.Pix
+			si := 0
+			di := 0
+			for si < len(src) {
+				dst[di] = src[si]
+				dst[di+1] = src[si+1]
+				dst[di+2] = src[si+2]
+				dst[di+3] = 255
+				si += 3
+				di += 4
+			}
+
+			var jpg bytes.Buffer
+			if err := jpeg.Encode(&jpg, img, &jpeg.Options{Quality: jpegQuality}); err != nil {
+				fmt.Printf("[Image Reencode] jpeg encode failed page=%d ref=%s err=%v\n", pageNr, refKey, err)
+				continue
+			}
+
+			jpgBytes := jpg.Bytes()
+			if len(jpgBytes) >= before {
+				fmt.Printf("[Image Reencode] skip no gain page=%d ref=%s before=%d jpeg=%d\n", pageNr, refKey, before, len(jpgBytes))
+				continue
+			}
+
+			sd.Raw = append([]byte(nil), jpgBytes...)
+			sd.Content = nil
+			sd.FilterPipeline = []types.PDFFilter{{Name: filter.DCT, DecodeParms: nil}}
+			sd.CSComponents = 3
+			sd.Update("Filter", types.Name(filter.DCT))
+			delete(sd.Dict, "DecodeParms")
+			sd.Update("ColorSpace", types.Name("DeviceRGB"))
+			streamLength := int64(len(sd.Raw))
+			sd.StreamLength = &streamLength
+			sd.Update("Length", types.Integer(streamLength))
+
+			reencoded++
+			beforeTotal += int64(before)
+			afterTotal += int64(len(jpgBytes))
+
 			fmt.Printf(
-				"[Image Scan] page=%d resource=%s ref=%s width=%d height=%d filter=%s colorSpace=%s bpc=%d rawBytes=%d contentBytes=%d sMask=%t\n",
+				"[Image Reencode] page=%d resource=%s ref=%s %dx%d %s before=%d jpeg=%d saved=%.1f%%\n",
 				pageNr,
 				resourceName,
 				refKey,
 				width,
 				height,
-				filterNames(sd),
-				imageColorSpace(sd),
-				bpc,
-				len(sd.Raw),
-				len(sd.Content),
-				hasSMask,
+				csName,
+				before,
+				len(jpgBytes),
+				float64(before-len(jpgBytes))/float64(before)*100,
 			)
 		}
 	}
 
-	fmt.Println("[Image Scan] =================================")
-	fmt.Println("[Image Scan] page image refs:", pageRefs)
-	fmt.Println("[Image Scan] unique image objects:", uniqueCount)
-	fmt.Println("[Image Scan] unique raw image bytes:", totalRawBytes)
-	fmt.Printf("[Image Scan] unique raw image MiB: %.2f\n", float64(totalRawBytes)/(1024*1024))
-	fmt.Println("[Image Scan] Finished")
+	fmt.Println("[Image Reencode] =================================")
+	fmt.Println("[Image Reencode] images reencoded:", reencoded)
+	fmt.Println("[Image Reencode] before bytes:", beforeTotal)
+	fmt.Println("[Image Reencode] after bytes:", afterTotal)
+	if beforeTotal > 0 {
+		fmt.Printf("[Image Reencode] saved: %.1f%%\n", float64(beforeTotal-afterTotal)/float64(beforeTotal)*100)
+	}
+	fmt.Println("[Image Reencode] Finished")
 
-	return nil
+	return reencoded, beforeTotal, afterTotal, nil
 }
 
 func deduplicateType3Fonts(ctx *model.Context) (int, int, int, error) {
@@ -455,8 +588,12 @@ func optimizePDF(this js.Value, args []js.Value) interface{} {
 		}
 	}
 
-	if err := scanImages(ctx); err != nil {
-		fmt.Println("[Image Scan] Error:", err)
+	imagesReencoded, imageBefore, imageAfter, err := reencodeLargeFlateImages(ctx)
+	if err != nil {
+		return map[string]interface{}{
+			"ok": false,
+			"error": fmt.Sprintf("Image reencode failed: %v", err),
+		}
 	}
 
 	totalType3, replaced, uniqueType3, err := deduplicateType3Fonts(ctx)
@@ -480,9 +617,9 @@ func optimizePDF(this js.Value, args []js.Value) interface{} {
 		return map[string]interface{}{"ok": false, "error": "pdfcpu returned empty PDF."}
 	}
 
-	fmt.Println("[Type3 Dedup] Original bytes:", len(inputBytes))
-	fmt.Println("[Type3 Dedup] Output bytes:", len(outputBytes))
-	fmt.Printf("[Type3 Dedup] Saved: %.1f%%\n", float64(len(inputBytes)-len(outputBytes))/float64(len(inputBytes))*100)
+	fmt.Println("[Final] Original bytes:", len(inputBytes))
+	fmt.Println("[Final] Output bytes:", len(outputBytes))
+	fmt.Printf("[Final] Saved: %.1f%%\n", float64(len(inputBytes)-len(outputBytes))/float64(len(inputBytes))*100)
 
 	jsOutput := js.Global().Get("Uint8Array").New(len(outputBytes))
 	copied = js.CopyBytesToJS(jsOutput, outputBytes)
@@ -501,12 +638,15 @@ func optimizePDF(this js.Value, args []js.Value) interface{} {
 		"type3Total":        totalType3,
 		"type3Unique":       uniqueType3,
 		"type3RefsReplaced": replaced,
+		"imagesReencoded":   imagesReencoded,
+		"imageBytesBefore":  imageBefore,
+		"imageBytesAfter":   imageAfter,
 	}
 }
 
 func main() {
 	api.DisableConfigDir()
 	js.Global().Set("pdfcpuOptimize", js.FuncOf(optimizePDF))
-	println("pdfcpu WASM ready - Type3 dedup + Image Scan")
+	println("pdfcpu WASM ready - Type3 dedup + JPEG image reencode")
 	select {}
 }
