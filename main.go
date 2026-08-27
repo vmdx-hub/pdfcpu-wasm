@@ -42,6 +42,18 @@ func analyzeType3Fonts(
 		return
 	}
 
+	// ========================================
+	// PageCount初期化
+	// ========================================
+
+	if err := ctx.EnsurePageCount(); err != nil {
+		fmt.Println(
+			"[Type3 Scan] EnsurePageCount failed:",
+			err,
+		)
+		return
+	}
+
 	pageCount := ctx.PageCount
 
 	fmt.Println(
@@ -613,7 +625,7 @@ func main() {
 	)
 
 	println(
-		"pdfcpu WASM ready - page resource Type3 scan v2",
+		"pdfcpu WASM ready - page resource Type3 scan v3",
 	)
 
 	select {}
