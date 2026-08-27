@@ -155,6 +155,146 @@ func type3Signature(ctx *model.Context, fontDict types.Dict) (string, string, er
 	return signature, hex.EncodeToString(sum[:]), nil
 }
 
+func filterNames(sd *types.StreamDict) string {
+	if sd == nil || len(sd.FilterPipeline) == 0 {
+		return "(none)"
+	}
+
+	names := make([]string, 0, len(sd.FilterPipeline))
+	for _, f := range sd.FilterPipeline {
+		names = append(names, f.Name)
+	}
+	return strings.Join(names, ",")
+}
+
+func imageDimension(ctx *model.Context, sd *types.StreamDict, key string) int {
+	if sd == nil {
+		return 0
+	}
+	obj, found := sd.Find(key)
+	if !found || obj == nil {
+		return 0
+	}
+	i, err := ctx.DereferenceInteger(obj)
+	if err != nil || i == nil {
+		return 0
+	}
+	return i.Value()
+}
+
+func imageColorSpace(sd *types.StreamDict) string {
+	if sd == nil {
+		return "(none)"
+	}
+	obj, found := sd.Find("ColorSpace")
+	if !found || obj == nil {
+		return "(none)"
+	}
+	return fmt.Sprintf("%v", obj)
+}
+
+func scanImages(ctx *model.Context) error {
+	if ctx == nil || ctx.XRefTable == nil {
+		return fmt.Errorf("missing PDF context")
+	}
+	if err := ctx.EnsurePageCount(); err != nil {
+		return err
+	}
+
+	fmt.Println("[Image Scan] Start")
+	fmt.Println("[Image Scan] page count:", ctx.PageCount)
+
+	seenUnique := map[string]bool{}
+	uniqueCount := 0
+	pageRefs := 0
+	totalRawBytes := 0
+
+	for pageNr := 1; pageNr <= ctx.PageCount; pageNr++ {
+		pageDict, _, _, err := ctx.PageDict(pageNr, true)
+		if err != nil || pageDict == nil {
+			continue
+		}
+
+		resObj, found := pageDict.Find("Resources")
+		if !found || resObj == nil {
+			continue
+		}
+		resDict, err := ctx.DereferenceDict(resObj)
+		if err != nil || resDict == nil {
+			continue
+		}
+
+		xObj, found := resDict.Find("XObject")
+		if !found || xObj == nil {
+			continue
+		}
+		xObjects, err := ctx.DereferenceDict(xObj)
+		if err != nil || xObjects == nil {
+			continue
+		}
+
+		for resourceName, obj := range xObjects {
+			sd, _, err := ctx.DereferenceStreamDict(obj)
+			if err != nil || sd == nil {
+				continue
+			}
+
+			subtypeObj, found := sd.Find("Subtype")
+			if !found || subtypeObj == nil {
+				continue
+			}
+			subtypeName, ok := subtypeObj.(types.Name)
+			if !ok || string(subtypeName) != "Image" {
+				continue
+			}
+
+			pageRefs++
+
+			refKey := fmt.Sprintf("%v", obj)
+			if !seenUnique[refKey] {
+				seenUnique[refKey] = true
+				uniqueCount++
+				totalRawBytes += len(sd.Raw)
+			}
+
+			width := imageDimension(ctx, sd, "Width")
+			height := imageDimension(ctx, sd, "Height")
+			bpc := 0
+			if p := sd.IntEntry("BitsPerComponent"); p != nil {
+				bpc = *p
+			}
+			hasSMask := false
+			if sm, found := sd.Find("SMask"); found && sm != nil {
+				hasSMask = true
+			}
+
+			fmt.Printf(
+				"[Image Scan] page=%d resource=%s ref=%s width=%d height=%d filter=%s colorSpace=%s bpc=%d rawBytes=%d contentBytes=%d sMask=%t\n",
+				pageNr,
+				resourceName,
+				refKey,
+				width,
+				height,
+				filterNames(sd),
+				imageColorSpace(sd),
+				bpc,
+				len(sd.Raw),
+				len(sd.Content),
+				hasSMask,
+			)
+		}
+	}
+
+	fmt.Println("[Image Scan] =================================")
+	fmt.Println("[Image Scan] page image refs:", pageRefs)
+	fmt.Println("[Image Scan] unique image objects:", uniqueCount)
+	fmt.Println("[Image Scan] unique raw image bytes:", totalRawBytes)
+	fmt.Printf("[Image Scan] unique raw image MiB: %.2f\n", float64(totalRawBytes)/(1024*1024))
+	fmt.Println("[Image Scan] Finished")
+
+	return nil
+}
+
 func deduplicateType3Fonts(ctx *model.Context) (int, int, int, error) {
 	if ctx == nil || ctx.XRefTable == nil {
 		return 0, 0, 0, fmt.Errorf("missing PDF context")
@@ -315,6 +455,10 @@ func optimizePDF(this js.Value, args []js.Value) interface{} {
 		}
 	}
 
+	if err := scanImages(ctx); err != nil {
+		fmt.Println("[Image Scan] Error:", err)
+	}
+
 	totalType3, replaced, uniqueType3, err := deduplicateType3Fonts(ctx)
 	if err != nil {
 		return map[string]interface{}{
@@ -350,12 +494,12 @@ func optimizePDF(this js.Value, args []js.Value) interface{} {
 	}
 
 	return map[string]interface{}{
-		"ok":              true,
-		"output":          jsOutput,
-		"originalSize":    len(inputBytes),
-		"outputSize":      len(outputBytes),
-		"type3Total":      totalType3,
-		"type3Unique":     uniqueType3,
+		"ok":                true,
+		"output":            jsOutput,
+		"originalSize":      len(inputBytes),
+		"outputSize":        len(outputBytes),
+		"type3Total":        totalType3,
+		"type3Unique":       uniqueType3,
 		"type3RefsReplaced": replaced,
 	}
 }
@@ -363,6 +507,6 @@ func optimizePDF(this js.Value, args []js.Value) interface{} {
 func main() {
 	api.DisableConfigDir()
 	js.Global().Set("pdfcpuOptimize", js.FuncOf(optimizePDF))
-	println("pdfcpu WASM ready - Type3 dedup enabled")
+	println("pdfcpu WASM ready - Type3 dedup + Image Scan")
 	select {}
 }
