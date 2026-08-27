@@ -49,6 +49,9 @@ func analyzeType3Fonts(
 
 	// ========================================
 	// XRefTable全走査
+	//
+	// /Type /Font は条件にしない
+	// /Subtype /Type3 のみで判定
 	// ========================================
 
 	for objectNumber, entry := range ctx.XRefTable.Table {
@@ -67,36 +70,20 @@ func analyzeType3Fonts(
 		}
 
 		// ========================================
-		// /Type /Font
-		// ========================================
-
-		typeObj, found := dict.Find("Type")
-
-		if !found || typeObj == nil {
-			continue
-		}
-
-		typeName, ok := typeObj.(types.Name)
-
-		if !ok {
-			continue
-		}
-
-		if string(typeName) != "Font" {
-			continue
-		}
-
-		// ========================================
 		// /Subtype /Type3
 		// ========================================
 
-		subtypeObj, found := dict.Find("Subtype")
+		subtypeObj, found :=
+			dict.Find("Subtype")
 
-		if !found || subtypeObj == nil {
+		if !found ||
+			subtypeObj == nil {
+
 			continue
 		}
 
-		subtypeName, ok := subtypeObj.(types.Name)
+		subtypeName, ok :=
+			subtypeObj.(types.Name)
 
 		if !ok {
 			continue
@@ -115,33 +102,43 @@ func analyzeType3Fonts(
 
 		// ========================================
 		// BaseFont取得
+		// Type3では無い場合もある
 		// ========================================
 
 		baseFont := "(none)"
 
-		baseFontObj, found := dict.Find("BaseFont")
+		baseFontObj, found :=
+			dict.Find("BaseFont")
 
-		if found && baseFontObj != nil {
+		if found &&
+			baseFontObj != nil {
 
-			switch v := baseFontObj.(type) {
+			switch v :=
+				baseFontObj.(type) {
 
 			case types.Name:
 
-				baseFont = string(v)
+				baseFont =
+					string(v)
 
 			default:
 
-				baseFont = fmt.Sprintf(
-					"%v",
-					v,
-				)
+				baseFont =
+					fmt.Sprintf(
+						"%v",
+						v,
+					)
 			}
 		}
 
-		baseFont = strings.TrimSpace(baseFont)
+		baseFont =
+			strings.TrimSpace(
+				baseFont,
+			)
 
 		if baseFont == "" {
-			baseFont = "(empty)"
+			baseFont =
+				"(empty)"
 		}
 
 		baseFontCounts[baseFont]++
@@ -176,7 +173,8 @@ func analyzeType3Fonts(
 		len(baseFontCounts),
 	)
 
-	for name, count := range baseFontCounts {
+	for name, count :=
+		range baseFontCounts {
 
 		list = append(
 			list,
@@ -191,11 +189,15 @@ func analyzeType3Fonts(
 		list,
 		func(i, j int) bool {
 
-			if list[i].count == list[j].count {
-				return list[i].name < list[j].name
+			if list[i].count ==
+				list[j].count {
+
+				return list[i].name <
+					list[j].name
 			}
 
-			return list[i].count > list[j].count
+			return list[i].count >
+				list[j].count
 		},
 	)
 
@@ -205,15 +207,20 @@ func analyzeType3Fonts(
 
 	maxDisplay := 30
 
-	if len(list) < maxDisplay {
-		maxDisplay = len(list)
+	if len(list) <
+		maxDisplay {
+
+		maxDisplay =
+			len(list)
 	}
 
 	fmt.Println(
 		"[Type3 Scan] Top BaseFont duplicates:",
 	)
 
-	for i := 0; i < maxDisplay; i++ {
+	for i := 0;
+		i < maxDisplay;
+		i++ {
 
 		fmt.Printf(
 			"[Type3 Scan] #%d count=%d BaseFont=%s\n",
@@ -227,17 +234,23 @@ func analyzeType3Fonts(
 	// Type3 object番号
 	// ========================================
 
-	sort.Ints(objectNumbers)
+	sort.Ints(
+		objectNumbers,
+	)
 
 	maxObjects := 50
 
-	if len(objectNumbers) < maxObjects {
-		maxObjects = len(objectNumbers)
+	if len(objectNumbers) <
+		maxObjects {
+
+		maxObjects =
+			len(objectNumbers)
 	}
 
 	if maxObjects > 0 {
 
-		firstObjects := objectNumbers[0:maxObjects]
+		firstObjects :=
+			objectNumbers[0:maxObjects]
 
 		fmt.Println(
 			"[Type3 Scan] First Type3 object numbers:",
@@ -273,7 +286,8 @@ func optimizePDF(
 
 	input := args[0]
 
-	if input.Type() != js.TypeObject {
+	if input.Type() !=
+		js.TypeObject {
 
 		return map[string]interface{}{
 			"ok":    false,
@@ -281,7 +295,10 @@ func optimizePDF(
 		}
 	}
 
-	length := input.Get("length").Int()
+	length :=
+		input.Get(
+			"length",
+		).Int()
 
 	if length <= 0 {
 
@@ -295,15 +312,17 @@ func optimizePDF(
 	// JS Uint8Array → Go []byte
 	// ========================================
 
-	inputBytes := make(
-		[]byte,
-		length,
-	)
+	inputBytes :=
+		make(
+			[]byte,
+			length,
+		)
 
-	copied := js.CopyBytesToGo(
-		inputBytes,
-		input,
-	)
+	copied :=
+		js.CopyBytesToGo(
+			inputBytes,
+			input,
+		)
 
 	if copied != length {
 
@@ -321,16 +340,17 @@ func optimizePDF(
 	// pdfcpu Configuration
 	// ========================================
 
-	conf := model.NewDefaultConfiguration()
+	conf :=
+		model.NewDefaultConfiguration()
 
-	// 通常の内部最適化
-	conf.Optimize = true
+	conf.Optimize =
+		true
 
-	// 未使用Resource削除
-	conf.OptimizeResourceDicts = true
+	conf.OptimizeResourceDicts =
+		true
 
-	// 重複Content Stream検出
-	conf.OptimizeDuplicateContentStreams = true
+	conf.OptimizeDuplicateContentStreams =
+		true
 
 	// ========================================
 	// Type3診断
@@ -346,15 +366,19 @@ func optimizePDF(
 	// pdfcpu Optimize
 	// ========================================
 
-	reader := bytes.NewReader(inputBytes)
+	reader :=
+		bytes.NewReader(
+			inputBytes,
+		)
 
 	var output bytes.Buffer
 
-	err := api.Optimize(
-		reader,
-		&output,
-		conf,
-	)
+	err :=
+		api.Optimize(
+			reader,
+			&output,
+			conf,
+		)
 
 	if err != nil {
 
@@ -367,7 +391,8 @@ func optimizePDF(
 		}
 	}
 
-	outputBytes := output.Bytes()
+	outputBytes :=
+		output.Bytes()
 
 	if len(outputBytes) <= 0 {
 
@@ -381,16 +406,23 @@ func optimizePDF(
 	// Go []byte → JS Uint8Array
 	// ========================================
 
-	jsOutput := js.Global().
-		Get("Uint8Array").
-		New(len(outputBytes))
+	jsOutput :=
+		js.Global().
+			Get(
+				"Uint8Array",
+			).
+			New(
+				len(outputBytes),
+			)
 
-	copied = js.CopyBytesToJS(
-		jsOutput,
-		outputBytes,
-	)
+	copied =
+		js.CopyBytesToJS(
+			jsOutput,
+			outputBytes,
+		)
 
-	if copied != len(outputBytes) {
+	if copied !=
+		len(outputBytes) {
 
 		return map[string]interface{}{
 			"ok": false,
@@ -420,17 +452,17 @@ func optimizePDF(
 
 func main() {
 
-	// ブラウザWASMでは
-	// 設定ディレクトリを使用しない
 	api.DisableConfigDir()
 
 	js.Global().Set(
 		"pdfcpuOptimize",
-		js.FuncOf(optimizePDF),
+		js.FuncOf(
+			optimizePDF,
+		),
 	)
 
 	println(
-		"pdfcpu WASM ready - enhanced optimize + Type3 scan",
+		"pdfcpu WASM ready - enhanced optimize + Type3 scan v2",
 	)
 
 	select {}
