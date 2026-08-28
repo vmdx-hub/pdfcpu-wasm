@@ -193,7 +193,12 @@ func installDiagnosticWrapper() {
 						}
 					}
 				}
-				return original.Invoke(args...)
+
+				invokeArgs := make([]any, len(args))
+				for i, arg := range args {
+					invokeArgs[i] = arg
+				}
+				return original.Invoke(invokeArgs...)
 			})
 			js.Global().Set("pdfcpuOptimize", wrapper)
 			fmt.Println("pdfcpu diagnostic wrapper ready - recursive XObject scan")
