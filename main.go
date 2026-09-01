@@ -32,8 +32,6 @@ var type3HashKeys = []string{
 const (
 	jpegQuality      = 85
 	minImageRawBytes = 500 * 1024
-	minImageWidth    = 1000
-	minImageHeight   = 700
 )
 
 func ignoreStreamKey(key string) bool {
@@ -234,6 +232,8 @@ func reencodeLargeFlateImages(ctx *model.Context) (int, int64, int64, error) {
 
 	fmt.Println("[Image Reencode] Start - new JPEG XObject mode")
 	fmt.Println("[Image Reencode] quality:", jpegQuality)
+	fmt.Println("[Image Reencode] minimum raw bytes:", minImageRawBytes)
+	fmt.Println("[Image Reencode] dimension filter: disabled")
 
 	// Map an original image object to the replacement JPEG image object.
 	// If the same image is referenced from multiple pages/resources, reuse the same replacement.
@@ -295,7 +295,7 @@ func reencodeLargeFlateImages(ctx *model.Context) (int, int64, int64, error) {
 
 			width := imageDimension(ctx, sd, "Width")
 			height := imageDimension(ctx, sd, "Height")
-			if width < minImageWidth || height < minImageHeight || len(sd.Raw) < minImageRawBytes {
+			if width <= 0 || height <= 0 || len(sd.Raw) < minImageRawBytes {
 				continue
 			}
 
